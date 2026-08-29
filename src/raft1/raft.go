@@ -72,6 +72,9 @@ type Raft struct {
 	pendingLastIncludeIndex int
 	pendingLastIncludeTerm  int
 	isPendingSnapshot       bool
+
+	applyCond   *sync.Cond
+	replicateCh chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -292,6 +295,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.persist()
 	}
 
+	currentCommit := rf.commitIndex
+
 	rf.lastContact = time.Now()
 	rf.role = Follower
 
@@ -337,6 +342,10 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.commitIndex = args.LeaderCommit
 	} else if args.LeaderCommit >= len(rf.logs)+rf.lastIncludeIndex {
 		rf.commitIndex = len(rf.logs) - 1 + rf.lastIncludeIndex
+	}
+
+	if rf.commitIndex > currentCommit {
+		rf.applyCond.Broadcast()
 	}
 }
 
@@ -398,6 +407,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	rf.mu.Unlock()
+
+	rf.applyCond.Broadcast()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -599,6 +610,8 @@ func (rf *Raft) updateCommit() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	currentCommit := rf.commitIndex
+
 	temp := make([]int, len(rf.matchIndex))
 	copy(temp, rf.matchIndex)
 	if rf.me < len(rf.peers)-1 {
@@ -612,6 +625,10 @@ func (rf *Raft) updateCommit() {
 		temp[len(rf.peers)-len(rf.peers)/2-1] > rf.commitIndex {
 		rf.commitIndex = temp[len(rf.peers)-len(rf.peers)/2-1]
 	}
+
+	if rf.commitIndex > currentCommit {
+		rf.applyCond.Broadcast()
+	}
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -620,6 +637,9 @@ func (rf *Raft) sendInstallSnapshot(server int, args InstallSnapshotArgs, reply 
 }
 
 func (rf *Raft) Contact() {
+	timer := time.NewTicker(time.Duration(100) * time.Millisecond)
+	defer timer.Stop()
+
 	args := AppendEntryArgs{}
 	term, _ := rf.GetState()
 	for {
@@ -639,7 +659,11 @@ func (rf *Raft) Contact() {
 			}
 			go rf.startAppend(i, args)
 		}
-		time.Sleep(time.Duration(100) * time.Millisecond)
+
+		select {
+		case <-rf.replicateCh:
+		case <-timer.C:
+		}
 	}
 }
 
@@ -674,11 +698,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.persist()
 
-	args := AppendEntryArgs{}
-	args.LeaderID = rf.me
-	args.Term = rf.currentTerm
-	index = len(rf.logs) - 1 + rf.lastIncludeIndex
+	index = rf.lastIncludeIndex + len(rf.logs) - 1
+
 	rf.mu.Unlock()
+
+	select {
+	case rf.replicateCh <- struct{}{}:
+	default:
+	}
 
 	return index, term, isLeader
 }
@@ -709,6 +736,11 @@ func (rf *Raft) ticker() {
 func (rf *Raft) applier() {
 	for {
 		rf.mu.Lock()
+
+		for rf.lastApplied >= rf.commitIndex && !rf.isPendingSnapshot {
+			rf.applyCond.Wait()
+		}
+
 		if !rf.isPendingSnapshot {
 			lastApplied := rf.lastApplied
 			commitIndex := rf.commitIndex
@@ -742,14 +774,6 @@ func (rf *Raft) applier() {
 			rf.lastApplied = applyMsg.SnapshotIndex
 			rf.mu.Unlock()
 		}
-
-		rf.mu.Lock()
-		if rf.lastApplied == rf.commitIndex {
-			rf.mu.Unlock()
-			time.Sleep(time.Duration(100) * time.Millisecond)
-		} else {
-			rf.mu.Unlock()
-		}
 	}
 }
 
@@ -781,6 +805,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastIncludeIndex = 0
 	rf.lastIncludeTerm = 0
 	rf.isPendingSnapshot = false
+	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.replicateCh = make(chan struct{}, 1)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

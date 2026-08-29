@@ -2,15 +2,14 @@ package kvraft
 
 import (
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
 )
-
 
 type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
-	leader int // last successful leader (index into servers[])
+	leader  int // last successful leader (index into servers[])
 	// You can add to this struct.
 }
 
@@ -37,6 +36,30 @@ func (ck *Clerk) Leader() int {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 	// You will have to modify this function.
+
+	leader := ck.leader
+
+	args := rpc.GetArgs{}
+	reply := rpc.GetReply{}
+	args.Key = key
+	for {
+		reply = rpc.GetReply{}
+		if ok := ck.clnt.Call(ck.servers[leader], "KVServer.Get", &args, &reply); !ok {
+			leader = (leader + 1) % len(ck.servers)
+			continue
+		}
+
+		if reply.Err == rpc.ErrWrongLeader {
+			leader = (leader + 1) % len(ck.servers)
+		} else {
+			ck.leader = leader
+			break
+		}
+	}
+
+	if reply.Err == rpc.OK || reply.Err == rpc.ErrNoKey {
+		return reply.Value, reply.Version, reply.Err
+	}
 	return "", 0, ""
 }
 
@@ -59,5 +82,40 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
+
+	leader := ck.leader
+	args := rpc.PutArgs{}
+	reply := rpc.PutReply{}
+	args.Key = key
+	args.Value = value
+	args.Version = version
+
+	flag := false
+	for {
+		reply = rpc.PutReply{}
+		if ok := ck.clnt.Call(ck.servers[leader], "KVServer.Put", &args, &reply); !ok {
+			leader = (leader + 1) % len(ck.servers)
+			flag = true
+			continue
+		}
+
+		if reply.Err == rpc.ErrWrongLeader {
+			leader = (leader + 1) % len(ck.servers)
+			flag = true
+		} else if reply.Err == rpc.ErrVersion {
+			ck.leader = leader
+			if flag {
+				reply.Err = rpc.ErrMaybe
+			}
+			break
+		} else {
+			ck.leader = leader
+			break
+		}
+	}
+
+	if reply.Err == rpc.OK || reply.Err == rpc.ErrMaybe || reply.Err == rpc.ErrNoKey || reply.Err == rpc.ErrVersion {
+		return reply.Err
+	}
 	return ""
 }
